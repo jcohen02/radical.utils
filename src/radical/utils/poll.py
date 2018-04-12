@@ -21,10 +21,10 @@ import threading as mt
 #     poller = select.poll()
 #     ...
 #
-# If `RU_USE_PYPOLL` is set (to an arbitrary, non-empty value) in the
+# If `RU_USE_PYPOLL` is set (to an arbitrary or empty value) in the
 # environment, we fall back to the native Python implementation.
 #
-_use_pypoll = os.environ.get('RU_USE_PYPOLL', False)
+_use_pypoll = bool('RU_USE_PYPOLL' in os.environ)
 
 
 # ------------------------------------------------------------------------------

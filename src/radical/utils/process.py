@@ -6,8 +6,8 @@ __license__   = "MIT"
 
 import os
 import sys
-import time
 import socket
+import Queue           as mq
 import threading       as mt
 import multiprocessing as mp
 import setproctitle    as spt
@@ -28,6 +28,134 @@ _WATCH_TIMEOUT = 0.2      # time between thread and process health polls.
                           # on the socketpair; is done in a watcher thread.
 _STOP_TIMEOUT  = 2.0     # time between temination signal and killing child
 _BUFSIZE       = 1024     # default buffer size for socket recvs
+
+
+# ------------------------------------------------------------------------------
+#
+# each process (not each `Process` object, but each system process!) will start
+# a watcher thread which will be responsible for watching *all* sockets of *all*
+# `Process` objects in this system process.  The thread is created here, it will
+# receive new thiings to watch via a queue.
+#
+# The watcher thread is a damon thread so that we don't need to actively
+# terminate it.
+#
+# NOTE: For several reasons, the watcher thread has no valid/stable means of
+#       directly signaling the main thread of any error conditions, it is thus
+#       necessary to manually check the respective events from time to time.
+#
+# NOTE: https://bugs.python.org/issue1856  (01/2008)
+#       `sys.exit()` can segfault Python if daemon threads are active.
+#       https://bugs.python.org/issue21963 (07/2014)
+#       This will not be fixed in python 2.x.
+#
+#       We make the Watcher thread a daemon anyway:
+#
+#       - when `sys.exit()` is called in a child process, we don't care
+#         about the process anymore anyway, and all terminfo data are
+#         sent to the parent anyway.
+#       - when `sys.exit()` is called in the parent on unclean shutdown,
+#         the same holds.
+#       - when `sys.exit()` is called in the parent on clean shutdown,
+#         then the watcher threads should already be terminated when the
+#         `sys.exit()` invocation happens
+#
+def _ru_watcher_work():
+    '''
+    When `Process.start()` is called, the parent process will create a socket
+    pair.  After fork, one end of that pair will be watched by the parent and
+    child, respectively, in their watcher threads.  If any error condition or
+    hangup is detected on those sockets, it is assumed that the process on the
+    other end died, and termination is initiated.
+
+    Since the watch happens in a thread, any termination requires the attention
+    and cooperation of the main thread.  No attempt is made on interrupting the
+    main thread, we only set the termination event associated with the socket,
+    and stop watching it. That signal needs to be checked by the main threads in
+    certain intervals.
+    '''
+
+    # we watch sockets and threads as long as we live, ie. until the main
+    # thread sets `self._ru_term`.
+    try:
+        # list of tuples of form `[watchable, mt.Event]`
+        sockets  = list()
+        things   = list()
+        poller   = ru_poll.poll()
+
+        while True:
+
+            # check if we have new things to watch
+            ret = None
+            try:
+                ret = _ru_watcher_queue.get(block=True, timeout=0.2)
+            except mq.Empty:
+                pass
+
+            if ret:
+                # we g ot something to watch - c  check if its a socket or an
+                # object with an `is_alive` method
+                thing, event = ret
+                is_alive = getattr(thing, "is_alive", None)
+                if callable(is_alive):
+                    things.append(thing)
+                else:
+                    sockets.append(thing)  
+                    poller.register(thing, 
+                            ru_poll.POLLIN  | ru_poll.POLLERR | ru_poll.POLLHUP)
+
+                # check if we have more to register
+                continue
+
+            # no new things anymore - watch what we have (if anything)
+            if not sockets and not things:
+                continue
+
+
+            # check object states
+            tripped = list()  # list of things which died
+            for thing, event in things:
+                if not thing.is_alive():
+                    event.set()
+                    tripped.append(thing)
+
+            things = [x for x in things if x[0] not in tripped]
+
+            # check socket states
+            tripped = list()             # list of things which died
+            events  = poller.poll(0.1)   # block just a little
+            for thing, event in events:
+
+                # check for error conditions
+                if  event & ru_poll.POLLHUP or  \
+                    event & ru_poll.POLLERR     :
+
+                    tripped.append(thing)
+
+            if tripped:
+                # set events, refresh socket list
+                new_sockets = list()
+                for thing, event in sockets:
+                    if thing in tripped:
+                        event.set
+                    else:
+                        new_sockets.append([thing, event])
+
+                sockets = new_sockets
+
+
+    except Exception as e:
+        print "ru watcher failed: %s" % e
+        sys.exit(-1)
+
+
+
+
+_ru_watcher_queue  = mq.Queue()
+_ru_watcher_thread = ru_Thread(name='ru.%s.watch' % os.getpid(),
+                               target=_ru_watcher_work)
+_ru_watcher_thread.daemon = True
+_ru_watcher_thread.start()
 
 
 # ------------------------------------------------------------------------------
@@ -106,7 +234,6 @@ class Process(mp.Process):
         self._ru_term        = None           # set to terminate watcher
         self._ru_initialized = False          # set to signal bootstrap success
         self._ru_terminating = False          # set to signal active termination
-        self._ru_watcher     = None           # watcher thread
         self._ru_things_lock = mt.Lock()      # lock for the above
         self._ru_things      = dict()         # registry of threads created in
                                               # (parent or child) process
@@ -235,133 +362,7 @@ class Process(mp.Process):
 
     # --------------------------------------------------------------------------
     #
-    def _ru_watch(self):
-        '''
-        When `start()` is called, the parent process will create a socket pair.
-        after fork, one end of that pair will be watched by the parent and
-        client, respectively, in separate watcher threads.  If any error
-        condition or hangup is detected on the socket, it is assumed that the
-        process on the other end died, and termination is initiated.
-
-        Since the watch happens in a subthread, any termination requires the
-        attention and cooperation of the main thread.  No attempt is made on
-        interrupting the main thread, we only set self._ru_term which needs to
-        be checked by the main threads in certain intervals.
-        '''
-
-        # we watch sockets and threads as long as we live, ie. until the main
-        # thread sets `self._ru_term`.
-        try:
-
-            self._ru_poller = ru_poll.poll(logger=self._ru_log)
-            self._ru_poller.register(self._ru_endpoint,
-                    ru_poll.POLLIN  | ru_poll.POLLERR | ru_poll.POLLHUP)
-                 #  ru_poll.POLLPRI | ru_poll.POLLNVAL)
-
-            last = 0.0  # we never watched anything until now
-            while not self._ru_term.is_set() :
-
-                # only do any watching if time is up
-                now = time.time()
-                if now - last < _WATCH_TIMEOUT:
-                    time.sleep(0.1)  # FIXME: configurable, load tradeoff
-                    continue
-
-                if  not self._ru_watch_socket() or \
-                    not self._ru_watch_things()    :
-                    return
-
-                last = now
-
-                # FIXME: also *send* any pending messages to the child.
-              # # check if any messages need to be sent.
-              # while True:
-              #     try:
-              #         msg = self._ru_msg_out.get_nowait()
-              #         self._ru_msg_send(msg)
-              #
-              #     except Queue.Empty:
-              #         # nothing more to send
-              #         break
-
-
-        except Exception as e:
-            # mayday... mayday...
-            self._ru_log.exception('watcher failed')
-
-        finally:
-            # no matter why we fell out of the loop: let the other end of the
-            # socket know by closing the socket endpoint.
-
-            # Fix radical-cybertools/radical.utils issue #120
-            # We need to call SHUTDOWN before we close the socket...
-            # From: https://docs.python.org/2/howto/sockets.html#disconnecting
-            self._ru_log.info('watcher closes')
-            self._ru_endpoint.shutdown(socket.SHUT_RDWR)
-            self._ru_endpoint.close()
-            self._ru_poller.close()
-
-            # `self.stop()` will be called from the main thread upon checking
-            # `self._ru_term` via `self.is_alive()`.
-            # FIXME: check
-            self._ru_term.set()
-
-
-    # --------------------------------------------------------------------------
-    #
-    def _ru_watch_socket(self):
-
-        # check health of parent/child relationship
-        events = self._ru_poller.poll(0.1)   # block just a little
-        for _,event in events:
-
-            # for alive checks, we poll socket state for
-            #   * data:   some message from the other end, logged
-            #   * error:  child failed   - terminate
-            #   * hangup: child finished - terminate
-
-            # check for messages
-            if event & ru_poll.POLLIN:
-
-                # we get a message!
-                #
-                # FIXME: BUFSIZE should not be hardcoded
-                # FIXME: we do nothing with the message yet, should be
-                #        stored in a message queue.
-
-                msg = self._ru_msg_recv(_BUFSIZE)
-                self._ru_log.info('message received: %s' % msg)
-                if msg == '':
-                    self._ru_log.warn('received empty string, parent closed ep')
-                    return False
-
-                if msg.strip() == 'STOP':
-                    self._ru_log.info('STOP received: %s' % msg)
-                    return False
-
-            # check for error conditions
-            if  event & ru_poll.POLLHUP or  \
-                event & ru_poll.POLLERR     :
-
-                # something happened on the other end, we are about to die
-                # out of solidarity (or panic?).
-                self._ru_log.warn('endpoint disappeard')
-                return False
-
-          # if event & ru_poll.POLLPRI:
-          #     self._ru_log.info('POLLPRI : %s', self._ru_endpoint.fileno())
-          # if event & ru_poll.POLLNVAL:
-          #     self._ru_log.info('POLLNVAL: %s', self._ru_endpoint.fileno())
-
-        time.sleep(0.1)
-
-      # self._ru_log.debug('endpoint watch ok')
-        return True
-
-
-    # --------------------------------------------------------------------------
-    #
-    def register_watchable(self, thing):
+    def register_watchable(self, thing, event=None):
         '''
         Add an object to watch.  If the object is at any point found to be not
         alive (`thing.is_alive()` returns `False`), an exception is raised which
@@ -389,9 +390,16 @@ class Process(mp.Process):
         assert(thing.join)
 
         with self._ru_things_lock:
+
             if thing.name in self._ru_things:
                 raise ValueError('already watching %s' % thing.name)
-            self._ru_things[thing.name] = thing
+
+            if not event:
+                event = mt.Event()
+
+            self._ru_things[thing.name] = [thing, event]
+
+            _ru_watcher_queue.put([thing, event])
 
 
     # --------------------------------------------------------------------------
@@ -403,19 +411,6 @@ class Process(mp.Process):
                 raise ValueError('%s is not watched' % name)
 
             del(self._ru_things[name])
-
-
-    # --------------------------------------------------------------------------
-    #
-    def _ru_watch_things(self):
-
-        with self._ru_things_lock:
-            for tname,thing in self._ru_things.iteritems():
-                if not thing.is_alive():
-                    self._ru_log.warn('%s died')
-                    return False
-
-        return True
 
 
     # --------------------------------------------------------------------------
@@ -655,11 +650,6 @@ class Process(mp.Process):
         except Exception as e:
             self._ru_log.warn('term msg error not sent: %s', repr(e))
 
-        # tear down child watcher
-        if self._ru_watcher:
-            self._ru_term.set()
-            self._ru_watcher.join(_STOP_TIMEOUT)
-
         # stop all things we watch
         with self._ru_things_lock:
             for tname,thing in self._ru_things.iteritems():
@@ -674,8 +664,10 @@ class Process(mp.Process):
         # distinguishing.
 
         with self._ru_things_lock:
-            for tname,thing in self._ru_things.iteritems():
+            for tname,data in self._ru_things.iteritems():
                 try:
+                    thing, event = data
+                    event.set()
                     thing.join(timeout=_STOP_TIMEOUT)
                 except Exception as e:
                     self._ru_log.exception('3 could not join %s [%s]', tname, e)
@@ -744,15 +736,12 @@ class Process(mp.Process):
         # call parent finalizers
         self._ru_finalize()
 
-        # tear down watcher - we wait for it to shut down, to avoid races
-        if self._ru_watcher:
-            self._ru_term.set()
-            self._ru_watcher.stop(timeout)
-
         # stop all things we watch
         with self._ru_things_lock:
-            for tname,thing in self._ru_things.iteritems():
+            for tname,data in self._ru_things.iteritems():
                 try:
+                    thing, event = data
+                    event.set()
                     thing.stop(timeout=timeout)
                 except Exception as e:
                     errors.append('could not stop %s [%s]' % (tname, e))
@@ -784,8 +773,9 @@ class Process(mp.Process):
         # `join()` will cause little overhead, so we don't bother
         # distinguishing.
         with self._ru_things_lock:
-            for tname,thing in self._ru_things.iteritems():
+            for tname,data in self._ru_things.iteritems():
                 try:
+                    thing, event = data
                     thing.join(timeout=timeout)
                 except Exception as e:
                     self._ru_log.exception('could not join %s [%s]', tname, e)
@@ -850,7 +840,7 @@ class Process(mp.Process):
             self._ru_initialized = True
 
         except Exception as e:
-            self._ru_log.exception('initialization error')
+            self._ru_log.exception('initialization error (%s)' % e)
             raise
 
 
@@ -869,41 +859,6 @@ class Process(mp.Process):
             # no child, so we won't need a watcher either
             return
 
-        # Start a separate thread which watches our end of the socket.  If that
-        # thread detects any failure on that socket, it will set
-        # `self._ru_term`, to signal its demise and prompt an exception from
-        # the main thread.
-        #
-        # NOTE: For several reasons, the watcher thread has no valid/stable
-        #       means of directly signaling the main thread of any error
-        #       conditions, it is thus necessary to manually check the child
-        #       state from time to time, via `self.is_alive()`.
-        #
-        # NOTE: https://bugs.python.org/issue1856  (01/2008)
-        #       `sys.exit()` can segfault Python if daemon threads are active.
-        #       https://bugs.python.org/issue21963 (07/2014)
-        #       This will not be fixed in python 2.x.
-        #
-        #       We make the Watcher thread a daemon anyway:
-        #
-        #       - when `sys.exit()` is called in a child process, we don't care
-        #         about the process anymore anyway, and all terminfo data are
-        #         sent to the parent anyway.
-        #       - when `sys.exit()` is called in the parent on unclean shutdown,
-        #         the same holds.
-        #       - when `sys.exit()` is called in the parent on clean shutdown,
-        #         then the watcher threads should already be terminated when the
-        #         `sys.exit()` invocation happens
-        #
-        # FIXME: check the conditions above
-        #
-        # FIXME: move to _ru_initialize_common
-        #
-        self._ru_watcher = ru_Thread(name='%s.watch' % self._ru_name,
-                                     target=self._ru_watch,
-                                     log=self._ru_log)
-        self._ru_watcher.start()
-
         self._ru_log.info('child is alive')
 
 
@@ -917,13 +872,6 @@ class Process(mp.Process):
         #
 
         self._ru_log.info('child (me) initializing')
-
-        # start the watcher thread
-        self._ru_watcher = ru_Thread(name='%s.watch' % self._ru_name,
-                                     target=self._ru_watch,
-                                     log=self._ru_log)
-        self._ru_watcher.start()
-
         self._ru_log.info('child (me) is alive')
 
 

@@ -346,12 +346,11 @@ def get_hostname():
     Look up the hostname
     """
 
-    global _hostname
     if not _hostname:
 
+        global _hostname
         if socket.gethostname().find('.') >= 0:
             _hostname = socket.gethostname()
-
         else:
             _hostname = socket.gethostbyaddr(socket.gethostname())[0]
 
@@ -367,10 +366,10 @@ def get_hostip(req=None, logger=None):
     If interface is not given, do some magic.
     """
 
-    global _hostip
     if _hostip:
         return _hostip
 
+    global _hostip
     AF_INET = netifaces.AF_INET
 
     # We create a ordered preference list, consisting of:
@@ -430,7 +429,6 @@ def get_hostip(req=None, logger=None):
                 logger.debug('check iface %s: disconnected', iface)
             continue
 
-      
         ip = info[AF_INET][0].get('addr')
         if logger:
             logger.debug('check iface %s: ip is %s', iface, ip)
@@ -474,11 +472,11 @@ def name2env(name):
 
 # ------------------------------------------------------------------------------
 #
-def get_env_ns(ns, key):
+def get_env_ns(key, ns, default=None):
     """
     get an environment setting within a namespace.  For example. 
 
-        get_env_ns('radical.pilot.umgr', 'verbose'), 
+        get_env_ns('verbose', 'radical.pilot.umgr'), 
 
     will return the value of the first found env variable from the following
     sequence:
@@ -498,19 +496,20 @@ def get_env_ns(ns, key):
     string.
     """
 
-    ns  = ns .upper().replace('.', '_')
-    key = key.upper().replace('.', '_')
-
-    elems = ns.split('_')
-    base  = ''
-
-    for elem in elems:
+    ns     = name2env(ns)
+    key    = name2env(key)
+    base   = ''
+    checks = list()
+    for elem in ns.split('_'):
         base += elem + '_'
         check = base + key
+        checks.append(check)
+
+    for check in reversed(checks):
         if check in os.environ:
             return os.environ[check]
 
-    return None
+    return default
 
 
 # ------------------------------------------------------------------------------

@@ -124,9 +124,9 @@ def get_version (mod_root):
 
 
 # ------------------------------------------------------------------------------
-# check python version. we need >= 2.7, <3.x
-if  sys.hexversion < 0x02070000 or sys.hexversion >= 0x03000000:
-    raise RuntimeError("%s requires Python 2.x (2.7 or higher)" % name)
+# check python version. we need >= 2.7
+if  sys.hexversion < 0x02070000:
+    raise RuntimeError("%s requires Python 2.7 or higher" % name)
 
 
 # ------------------------------------------------------------------------------
@@ -198,7 +198,7 @@ def makeDataFiles(prefix, dir):
     os.path.walk(dir, visit, (prefix, strip, found))
     return found
 
-def visit((prefix, strip, found), dirname, names):
+def visit(tup, dirname, names):
     """ Visit directory, create distutil tuple
 
     Add distutil tuple for each directory using this format:
@@ -206,6 +206,7 @@ def visit((prefix, strip, found), dirname, names):
 
     distutil will copy later file1, file2, ... info destination.
     """
+    prefix, strip, found = tup
     files = []
     # Iterate over a copy of names, modify names
     for name in names[:]:

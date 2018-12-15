@@ -12,7 +12,7 @@ import threading       as mt
 import multiprocessing as mp
 import setproctitle    as spt
 
-from .logger  import get_logger
+from .logger  import Logger
 from .threads import Thread as ru_Thread
 from .        import poll   as ru_poll
 
@@ -26,7 +26,7 @@ _START_TIMEOUT = 20.0     # time to wait for process startup signal.
 _WATCH_TIMEOUT = 0.2      # time between thread and process health polls.
                           # health poll: check for recv, error and abort
                           # on the socketpair; is done in a watcher thread.
-_STOP_TIMEOUT  = 2.0     # time between temination signal and killing child
+_STOP_TIMEOUT  = 2.0      # time between temination signal and killing child
 _BUFSIZE       = 1024     # default buffer size for socket recvs
 
 
@@ -284,7 +284,7 @@ class Process(mp.Process):
 
         if not self._ru_log:
             # if no logger is passed down, log to null (FIXME)
-            self._ru_log = get_logger('radical.util.process', target='2')
+            self._ru_log = Logger('radical.util.process')
             self._ru_log.debug('name: %s' % self._ru_name)
 
 
@@ -353,11 +353,138 @@ class Process(mp.Process):
 
         except socket.timeout:
             self._ru_log.warn('recv timed out')
-            return ''
+
         except Exception as e:
             # this should only happen once the EP is done for - terminate
             self._ru_log.warn('recv failed (%s) - terminate', e)
             self._ru_term.set()
+
+
+    # --------------------------------------------------------------------------
+    #
+    def _ru_watch(self):
+        '''
+        When `start()` is called, the parent process will create a socket pair.
+        after fork, one end of that pair will be watched by the parent and
+        client, respectively, in separate watcher threads.  If any error
+        condition or hangup is detected on the socket, it is assumed that the
+        process on the other end died, and termination is initiated.
+
+        Since the watch happens in a subthread, any termination requires the
+        attention and cooperation of the main thread.  No attempt is made on
+        interrupting the main thread, we only set self._ru_term which needs to
+        be checked by the main threads in certain intervals.
+        '''
+
+        # we watch sockets and threads as long as we live, ie. until the main
+        # thread sets `self._ru_term`.
+        try:
+
+            self._ru_poller = ru_poll.poll(logger=self._ru_log)
+            self._ru_poller.register(self._ru_endpoint,
+                    ru_poll.POLLIN  | ru_poll.POLLERR | ru_poll.POLLHUP)
+                 #  ru_poll.POLLPRI | ru_poll.POLLNVAL)
+
+            last = 0.0  # we never watched anything until now
+            while not self._ru_term.is_set() :
+
+                # only do any watching if time is up
+                now = time.time()
+                if now - last < _WATCH_TIMEOUT:
+                    time.sleep(0.1)  # FIXME: configurable, load tradeoff
+                    continue
+
+                if  not self._ru_watch_socket() or \
+                    not self._ru_watch_things()    :
+                    return
+
+                last = now
+
+                # FIXME: also *send* any pending messages to the child.
+              # # check if any messages need to be sent.
+              # while True:
+              #     try:
+              #         msg = self._ru_msg_out.get_nowait()
+              #         self._ru_msg_send(msg)
+              #
+              #     except Queue.Empty:
+              #         # nothing more to send
+              #         break
+
+
+        except Exception as e:
+            # mayday... mayday...
+            self._ru_log.exception('watcher failed')
+
+        finally:
+            # no matter why we fell out of the loop: let the other end of the
+            # socket know by closing the socket endpoint.
+
+            # Fix radical-cybertools/radical.utils issue #120
+            # We need to call SHUTDOWN before we close the socket...
+            # From: https://docs.python.org/2/howto/sockets.html#disconnecting
+            self._ru_log.info('watcher closes')
+            self._ru_endpoint.shutdown(socket.SHUT_RDWR)
+            self._ru_endpoint.close()
+            self._ru_poller.close()
+
+            # `self.stop()` will be called from the main thread upon checking
+            # `self._ru_term` via `self.is_alive()`.
+            # FIXME: check
+            self._ru_term.set()
+
+
+    # --------------------------------------------------------------------------
+    #
+    def _ru_watch_socket(self):
+
+        # check health of parent/child relationship
+        events = self._ru_poller.poll(0.1)   # block just a little
+        for _,event in events:
+
+            # for alive checks, we poll socket state for
+            #   * data:   some message from the other end, logged
+            #   * error:  child failed   - terminate
+            #   * hangup: child finished - terminate
+
+            # check for messages
+            if event & ru_poll.POLLIN:
+
+                # we get a message!
+                #
+                # FIXME: BUFSIZE should not be hardcoded
+                # FIXME: we do nothing with the message yet, should be
+                #        stored in a message queue.
+
+                msg = self._ru_msg_recv(_BUFSIZE)
+                self._ru_log.info('message received: %s' % msg)
+
+                if msg in [None, '']:
+                    self._ru_log.warn('no message, parent closed ep!')
+                    return False
+
+                elif msg.strip() == 'STOP':
+                    self._ru_log.info('STOP received: %s' % msg)
+                    return False
+
+            # check for error conditions
+            if  event & ru_poll.POLLHUP or  \
+                event & ru_poll.POLLERR     :
+
+                # something happened on the other end, we are about to die
+                # out of solidarity (or panic?).
+                self._ru_log.warn('endpoint disappeard')
+                return False
+
+          # if event & ru_poll.POLLPRI:
+          #     self._ru_log.info('POLLPRI : %s', self._ru_endpoint.fileno())
+          # if event & ru_poll.POLLNVAL:
+          #     self._ru_log.info('POLLNVAL: %s', self._ru_endpoint.fileno())
+
+        time.sleep(0.1)
+
+      # self._ru_log.debug('endpoint watch ok')
+        return True
 
 
     # --------------------------------------------------------------------------
